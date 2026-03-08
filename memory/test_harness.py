@@ -15,7 +15,7 @@ import re
 import threading
 from typing import Dict, List, Optional
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from load_dataset import LoCoMoSample
 
@@ -431,6 +431,17 @@ class TestHarness:
         results = []
         qa_list = sample.qa[:max_questions] if max_questions else sample.qa
 
+        if not qa_list:
+            logger.info("No questions to test.")
+            return []
+
+        requested_workers = max(1, int(n_workers))
+        n_workers = min(requested_workers, len(qa_list))
+        if requested_workers > len(qa_list):
+            logger.info(
+                f"Requested {requested_workers} workers but only {len(qa_list)} questions; "
+                f"using {n_workers} workers."
+            )
         logger.info(f"Testing {len(qa_list)} questions with {n_workers} parallel workers")
 
         metrics_lock = threading.Lock()
@@ -576,37 +587,49 @@ class TestHarness:
 
             # Submit all tasks
             futures = []
+            future_to_qa_idx = {}
             for qa_idx, qa in enumerate(qa_list, 1):
                 future = executor.submit(process_single_question, (qa_idx, qa))
                 futures.append((qa_idx, future))
+                future_to_qa_idx[future] = qa_idx
 
-            # Collect results as they complete
-            for qa_idx, future in futures:
+            # Collect results as they complete (better throughput/UX at high concurrency)
+            for future in as_completed(future_to_qa_idx):
+                qa_idx = future_to_qa_idx[future]
                 try:
                     result, is_correct, metrics, llm_score = future.result()
                     results.append(result)
-
-                    # Update progress bar with current metrics (thread-safe read)
-                    completed = len(results)
-                    with metrics_lock:
-                        accuracy = correct_count[0] / completed * 100 if completed > 0 else 0
-                        avg_f1 = total_f1[0] / completed * 100 if completed > 0 else 0
-                        avg_bleu1 = total_bleu1[0] / completed * 100 if completed > 0 else 0
-                        avg_llm = (total_llm_score[0] / llm_scores_count[0] * 100) if llm_scores_count[0] > 0 else 0
-
-                    pbar.set_postfix({
-
-                        'F1': f'{avg_f1:.1f}%',
-
-                        'LLM': f'{avg_llm:.1f}%'
-                    })
-                    pbar.update(1)
-
                 except Exception as e:
                     logger.error(f"Error collecting result for question {qa_idx}: {e}")
-                    pbar.update(1)
+                    # Preserve length and order: append error result so len(results) == len(qa_list)
+                    qa = qa_list[qa_idx - 1]
+                    results.append({
+                        'question_id': qa_idx,
+                        'question': qa.question,
+                        'category': qa.category,
+                        'expected': qa.final_answer,
+                        'predicted': f"ERROR: {str(e)}",
+                        'correct': False,
+                        'context_nodes': 0,
+                        'processing_time': 0.0,
+                        'metrics': None,
+                        'llm_judge_score': 0.0,
+                        'search_details': {},
+                        'error': str(e),
+                    })
+
+                # Update progress bar (thread-safe read of metrics)
+                completed = len(results)
+                with metrics_lock:
+                    avg_f1 = total_f1[0] / completed * 100 if completed > 0 else 0
+                    avg_llm = (total_llm_score[0] / llm_scores_count[0] * 100) if llm_scores_count[0] > 0 else 0
+                pbar.set_postfix({'F1': f'{avg_f1:.1f}%', 'LLM': f'{avg_llm:.1f}%'})
+                pbar.update(1)
 
             pbar.close()
+
+        # Ensure results are ordered by question_id (robust if execution order ever changes)
+        results.sort(key=lambda r: r['question_id'])
 
         logger.info(f"Completed {len(results)} questions")
         logger.info(f"Final Accuracy: {correct_count[0]}/{len(results)} ({100*correct_count[0]/len(results):.1f}%)")

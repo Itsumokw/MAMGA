@@ -82,14 +82,21 @@ class Evaluator:
             result['is_correct'] = False
 
         if self.use_llm_judge and self.llm_judge and gold_answer:
-            llm_result = self.llm_judge.evaluate_answer(
-                question,
-                str(gold_answer),
-                predicted_answer,
-                question_category=question_category
-            )
-            result['llm_judge_score'] = llm_result.get('score', 0.0)
-            result['llm_judge_reasoning'] = llm_result.get('reasoning', '')
+            try:
+                llm_result = self.llm_judge.evaluate_answer(
+                    question,
+                    str(gold_answer),
+                    predicted_answer,
+                    question_category=question_category
+                )
+                result['llm_judge_score'] = llm_result.get('score', 0.0)
+                result['llm_judge_reasoning'] = llm_result.get('reasoning', '')
+            except Exception as e:
+                # High-concurrency runs can hit transient API errors/rate limits.
+                # Keep the sample result instead of failing the whole question.
+                logger.warning(f"LLM judge failed, fallback to metrics-only scoring: {e}")
+                result['llm_judge_score'] = 0.0
+                result['llm_judge_reasoning'] = f"LLM judge unavailable: {str(e)}"
         else:
             result['llm_judge_score'] = 0.0
             result['llm_judge_reasoning'] = ''

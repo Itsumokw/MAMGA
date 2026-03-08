@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 import pickle
 from pathlib import Path
 import time
+import threading
 
 # Optional imports
 try:
@@ -71,7 +72,8 @@ class OpenAIController(BaseLLMController):
                 raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY environment variable.")
             base_url = os.getenv('OPENAI_BASE_URL')
             self.client = OpenAI(api_key=api_key, **({"base_url": base_url} if base_url else {}))
-            # Track token usage across all API calls
+            # Track token usage across all API calls (thread-safe for parallel testing)
+            self._token_lock = threading.Lock()
             self.token_usage = {
                 'prompt_tokens': [],
                 'completion_tokens': [],
@@ -95,25 +97,28 @@ class OpenAIController(BaseLLMController):
             max_tokens=1000
         )
 
-        # Track token usage from this API call
+        # Track token usage from this API call (thread-safe for high concurrency)
         if hasattr(response, 'usage'):
-            self.token_usage['prompt_tokens'].append(response.usage.prompt_tokens)
-            self.token_usage['completion_tokens'].append(response.usage.completion_tokens)
-            self.token_usage['total_tokens'].append(response.usage.total_tokens)
+            with self._token_lock:
+                self.token_usage['prompt_tokens'].append(response.usage.prompt_tokens)
+                self.token_usage['completion_tokens'].append(response.usage.completion_tokens)
+                self.token_usage['total_tokens'].append(response.usage.total_tokens)
 
         return response.choices[0].message.content
 
     def get_token_stats(self) -> dict:
-        """Return statistics on token usage"""
+        """Return statistics on token usage (thread-safe read)"""
         stats = {}
+        with self._token_lock:
+            usage = {k: list(v) for k, v in self.token_usage.items()}
         for key in ['prompt_tokens', 'completion_tokens', 'total_tokens']:
-            if self.token_usage[key]:
+            if usage[key]:
                 stats[key] = {
-                    'total': sum(self.token_usage[key]),
-                    'average': sum(self.token_usage[key]) / len(self.token_usage[key]),
-                    'min': min(self.token_usage[key]),
-                    'max': max(self.token_usage[key]),
-                    'count': len(self.token_usage[key])
+                    'total': sum(usage[key]),
+                    'average': sum(usage[key]) / len(usage[key]),
+                    'min': min(usage[key]),
+                    'max': max(usage[key]),
+                    'count': len(usage[key])
                 }
             else:
                 stats[key] = {'total': 0, 'average': 0, 'min': 0, 'max': 0, 'count': 0}
