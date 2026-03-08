@@ -69,7 +69,8 @@ class OpenAIController(BaseLLMController):
                 api_key = os.getenv('OPENAI_API_KEY')
             if api_key is None:
                 raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY environment variable.")
-            self.client = OpenAI(api_key=api_key)
+            base_url = os.getenv('OPENAI_BASE_URL')
+            self.client = OpenAI(api_key=api_key, **({"base_url": base_url} if base_url else {}))
             # Track token usage across all API calls
             self.token_usage = {
                 'prompt_tokens': [],

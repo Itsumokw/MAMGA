@@ -366,6 +366,8 @@ def main():
     parser.add_argument("--best-of-n-method", type=str, default="llm_judge",
                        choices=["llm_judge", "voting", "f1"],
                        help="Method for selecting best answer: 'llm_judge', 'voting', or 'f1' (default: llm_judge)")
+    parser.add_argument("--n-memory-workers", type=int, default=1,
+                       help="Number of parallel workers for memory building LLM extraction (default: 1, sequential)")
     parser.add_argument("--ablation", type=str, default=None,
                        choices=["basic_retrieval", "no_causal", "no_temporal", "flat_graph"],
                        help="Run ablation study with specific configuration")
@@ -459,7 +461,7 @@ def main():
             builder.load()
         else:
             logger.info("Building memory...")
-            stats = builder.build_memory(sample)
+            stats = builder.build_memory(sample, n_extract_workers=args.n_memory_workers)
             builder.save()
             # print(f"Memory built: {stats}")
 

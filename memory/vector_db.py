@@ -530,6 +530,33 @@ class NumpyVectorDB(VectorDBInterface):
             }
             self.dimension = save_data["dimension"]
 
+class _OpenAIEmbedder:
+    """Inline OpenAI embeddings (no separate openai_encoder module)."""
+    DIMENSIONS = {'text-embedding-3-small': 1536, 'text-embedding-ada-002': 1536}
+
+    def __init__(self, model_name: str = 'text-embedding-3-small'):
+        from openai import OpenAI
+        self.model_name = model_name
+        self.dimension = self.DIMENSIONS.get(model_name, 1536)
+        api_key = os.getenv('OPENAI_API_KEY')
+        base_url = os.getenv('OPENAI_BASE_URL')
+        self.client = OpenAI(api_key=api_key, **({'base_url': base_url} if base_url else {}))
+
+    def encode(self, texts: Union[str, List[str]]) -> np.ndarray:
+        if isinstance(texts, str):
+            texts = [texts]
+        r = self.client.embeddings.create(model=self.model_name, input=texts)
+        out = np.array([e.embedding for e in r.data], dtype=np.float32)
+        if len(texts) == 1:
+            return out[0]
+        return out
+
+    def encode_batch(self, texts: List[str], batch_size: int = 100) -> np.ndarray:
+        batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
+        parts = [self.encode(b) for b in batches]
+        return np.vstack(parts).astype(np.float32)
+
+
 class VectorEncoder:
     """Helper class for encoding text to vectors"""
 
@@ -543,10 +570,8 @@ class VectorEncoder:
         self.use_openai = use_openai
 
         if use_openai:
-            # Use OpenAI encoder
             try:
-                from .openai_encoder import OpenAIVectorEncoder
-                self.encoder = OpenAIVectorEncoder(model_name)
+                self.encoder = _OpenAIEmbedder(model_name)
                 self.dimension = self.encoder.dimension
                 logger.info(f"Using OpenAI embeddings ({model_name}, {self.dimension} dims)")
             except Exception as e:

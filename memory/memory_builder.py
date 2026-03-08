@@ -14,6 +14,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
 from .trg_memory import TemporalResonanceGraphMemory, Link, LinkType
@@ -944,33 +945,41 @@ class MemoryBuilder:
 
         return stats
 
-    def build_memory(self, sample) -> Dict:
+    def build_memory(self, sample, n_extract_workers: int = 1, desc_prefix: str = "") -> Dict:
         """
         Build TRG memory from a LoCoMo sample.
 
+        When n_extract_workers > 1, LLM-based event extraction (I/O-bound)
+        runs in parallel via ThreadPoolExecutor while graph insertion stays
+        sequential to protect shared state.
+
         Args:
             sample: LoCoMoSample object
+            n_extract_workers: parallel workers for LLM event extraction
+            desc_prefix: prefix for progress bar descriptions (e.g. "[S0] ")
 
         Returns:
             Statistics about the built memory
         """
         stats = self.trg.get_statistics()
         stats['events_created'] = 0
-        logger.info(f"Starting memory build. Initial stats: {stats}")
 
-        logger.info("Creating SESSION nodes from session summaries...")
         self.create_session_nodes(sample)
-        logger.info(f"Created {len(self.session_nodes)} SESSION nodes")
 
-        total_turns = sum(
-            len(session.turns)
-            for session in sample.conversation.sessions.values()
-        )
+        # Collect all turns with context
+        all_tasks = []
+        for session_id in sorted(sample.conversation.sessions.keys()):
+            session = sample.conversation.sessions[session_id]
+            timestamp = self.temporal_parser.parse_session_timestamp(session.date_time)
+            turns_list = list(session.turns)
+            for i, turn in enumerate(turns_list):
+                prev_turn = turns_list[i - 1] if i > 0 else None
+                next_turn = turns_list[i + 1] if i < len(turns_list) - 1 else None
+                all_tasks.append((session_id, timestamp, turn, prev_turn, next_turn))
 
-        pbar = tqdm(total=total_turns, desc="Building memory")
-        created_event_ids = []
-        episode_buffer_events = []
+        total_turns = len(all_tasks)
 
+        # Disable per-event link creation (batch is more efficient)
         orig_temporal = self.trg._create_temporal_links
         orig_semantic = self.trg._create_semantic_links
         self.trg._create_temporal_links = lambda node: None
@@ -979,61 +988,80 @@ class MemoryBuilder:
         if self.use_episodes and self.episode_segmenter:
             self.episode_segmenter.reset()
 
-        for session_id in sorted(sample.conversation.sessions.keys()):
-            session = sample.conversation.sessions[session_id]
-            timestamp = self.temporal_parser.parse_session_timestamp(session.date_time)
+        # --- Phase 1: Extract events (parallelizable I/O-bound LLM calls) ---
+        def _extract_one(task):
+            sid, ts, turn, prev_t, next_t = task
+            try:
+                return self.extract_event(turn, sid, ts, prev_t, next_t)
+            except Exception as e:
+                logger.error(f"Event extraction failed: {e}")
+                return None
 
-            turns_list = list(session.turns)
+        if n_extract_workers > 1:
+            with ThreadPoolExecutor(max_workers=n_extract_workers) as pool:
+                extracted = list(tqdm(
+                    pool.map(_extract_one, all_tasks),
+                    total=total_turns,
+                    desc=f"{desc_prefix}Extracting events",
+                    leave=False,
+                ))
+        else:
+            extracted = []
+            for task in tqdm(all_tasks, desc=f"{desc_prefix}Extracting events", leave=False):
+                extracted.append(_extract_one(task))
 
-            for i, turn in enumerate(turns_list):
-                prev_turn = turns_list[i - 1] if i > 0 else None
-                next_turn = turns_list[i + 1] if i < len(turns_list) - 1 else None
+        # --- Phase 2: Insert into graph sequentially (shared state) ---
+        created_event_ids = []
+        episode_buffer_events = []
 
-                event_data = self.extract_event(turn, session_id, timestamp, prev_turn, next_turn)
+        for task, event_data in tqdm(
+            zip(all_tasks, extracted),
+            total=total_turns,
+            desc=f"{desc_prefix}Building graph",
+            leave=False,
+        ):
+            if event_data is None:
+                continue
+            session_id = task[0]
+            try:
+                event_id = self.trg.add_event(
+                    interaction_content=event_data['content'],
+                    timestamp=event_data['timestamp'],
+                    metadata=event_data['metadata']
+                )
+                stats['events_created'] += 1
+                created_event_ids.append(event_id)
 
-                try:
-                    event_id = self.trg.add_event(
-                        interaction_content=event_data['content'],
-                        timestamp=event_data['timestamp'],
-                        metadata=event_data['metadata']
-                    )
-                    stats['events_created'] += 1
-                    created_event_ids.append(event_id)
+                if session_id in self.session_event_map:
+                    self.session_event_map[session_id].append(event_id)
 
-                    if session_id in self.session_event_map:
-                        self.session_event_map[session_id].append(event_id)
+                self.index_event(
+                    event_id,
+                    event_data['metadata'].get('original_text', ''),
+                    event_data['metadata']
+                )
 
-                    self.index_event(
-                        event_id,
-                        event_data['metadata'].get('original_text', ''),
-                        event_data['metadata']
-                    )
+                if self.use_episodes:
+                    episode_buffer_events.append(event_id)
 
-                    if self.use_episodes:
-                        episode_buffer_events.append(event_id)
+            except Exception as e:
+                logger.error(f"Failed to add event: {e}")
 
-                except Exception as e:
-                    logger.error(f"Failed to add event: {e}")
-
-                if self.use_episodes and self.episode_segmenter:
-                    turn_data = {
-                        'speaker': turn.speaker,
-                        'text': turn.text,
-                        'timestamp': event_data['timestamp'].isoformat(),
-                        'dia_id': turn.dia_id,
-                        'entities': event_data['metadata'].get('entities', []),
-                        'topic': event_data['metadata'].get('topic', ''),
-                        'dates_mentioned': event_data['metadata'].get('dates_mentioned', [])
-                    }
-
-                    episode = self.episode_segmenter.process_turn(turn_data)
-                    if episode:
-                        episode_id = self.create_episode_node(episode, session_id, episode_buffer_events)
-                        self.create_episode_event_links(episode_id, episode_buffer_events)
-                        episode_buffer_events = []
-
-                pbar.update(1)
-                pbar.set_postfix({'Events': stats['events_created'], 'Episodes': len(self.episode_nodes)})
+            if self.use_episodes and self.episode_segmenter:
+                turn_data = {
+                    'speaker': task[2].speaker,
+                    'text': task[2].text,
+                    'timestamp': event_data['timestamp'].isoformat(),
+                    'dia_id': task[2].dia_id,
+                    'entities': event_data['metadata'].get('entities', []),
+                    'topic': event_data['metadata'].get('topic', ''),
+                    'dates_mentioned': event_data['metadata'].get('dates_mentioned', [])
+                }
+                episode = self.episode_segmenter.process_turn(turn_data)
+                if episode:
+                    episode_id = self.create_episode_node(episode, session_id, episode_buffer_events)
+                    self.create_episode_event_links(episode_id, episode_buffer_events)
+                    episode_buffer_events = []
 
         if self.use_episodes and self.episode_segmenter:
             final = self.episode_segmenter.finalize()
@@ -1041,18 +1069,13 @@ class MemoryBuilder:
                 episode_id = self.create_episode_node(final, session_id, episode_buffer_events)
                 self.create_episode_event_links(episode_id, episode_buffer_events)
 
-        pbar.close()
-
         self.trg._create_temporal_links = orig_temporal
         self.trg._create_semantic_links = orig_semantic
 
-        logger.info("Creating batch links...")
+        # --- Phase 3: Batch link creation ---
         link_stats = self.batch_create_links(created_event_ids)
-
-        logger.info("Creating session links...")
         session_links = self.create_session_links()
         link_stats['session_links'] = session_links
-        logger.info(f"Created {session_links} BELONGS_TO_SESSION links")
 
         if self.use_episodes and self.episode_nodes:
             episode_link_stats = self.batch_create_links(self.episode_nodes)
@@ -1062,9 +1085,7 @@ class MemoryBuilder:
 
         final_stats = self.trg.get_statistics()
         final_stats['link_breakdown'] = link_stats
-
-        total_links_created = sum(link_stats.values())
-        final_stats['links_created'] = total_links_created
+        final_stats['links_created'] = sum(link_stats.values())
 
         if self.use_episodes:
             final_stats['episode_count'] = len(self.episode_nodes)
@@ -1073,7 +1094,6 @@ class MemoryBuilder:
                 if self.episode_nodes else 0
             )
 
-        logger.info(f"Memory build complete. Final stats: {final_stats}")
         return final_stats
 
     def save(self):

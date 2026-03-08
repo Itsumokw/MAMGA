@@ -9,7 +9,11 @@ import dotenv
 
 dotenv.load_dotenv()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+_base_url = os.getenv("OPENAI_BASE_URL")
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    **({'base_url': _base_url} if _base_url else {})
+)
 
 ACCURACY_PROMPT = """
 Score the answer on a scale from 0.0 to 1.0 based on semantic correctness.

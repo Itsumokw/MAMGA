@@ -54,6 +54,13 @@ cp .env.example .env
 
 ## Quick Start
 
+### Run in Google Colab
+
+You can run the LoCoMo evaluation directly in Colab without uploading files: the notebook clones this repo and runs `test_fixed_memory.py` via the command line.
+
+- **Open in Colab**: [MAMGA_Colab.ipynb](https://colab.research.google.com/github/FredJiang0324/MAMGA/blob/main/MAMGA_Colab.ipynb)  
+  (If you use your own fork, open the notebook from your fork and it will clone your repo.)
+
 ### Testing with LoCoMo Dataset
 
 ```bash
